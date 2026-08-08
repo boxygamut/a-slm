@@ -52,6 +52,8 @@ class GroupedQueryAttention(nn.Module):
             bias = False
         )
 
+        self.rms_norm = nn.RMSNorm(hidden_size)
+
     def create_mask(self, T, device):
         positions = torch.arange(T, device = device)
 
@@ -70,6 +72,8 @@ class GroupedQueryAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.shape
+
+        x = self.rms_norm(x)
         
         q = (
             self.queries(x)
