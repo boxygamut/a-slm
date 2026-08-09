@@ -3,29 +3,51 @@ import torch.nn as nn
 import math
 
 
-class MLP(nn.Module): # Add gated projection and use SwiGLU
-    def __init__(self, hidden_size):
+class SwiGLU(nn.Module):
+    def __init__(self, hidden_size, intermediate_size):
         super().__init__()
+
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
         
-        self.net = nn.Sequential(
-            nn.Linear(hidden_size, 4 * hidden_size),
-            nn.GELU(),
-            nn.Linear(hidden_size * 4, hidden_size)
+        self.up_proj = nn.Linear(
+            hidden_size,
+            intermediate_size,
+            bias = False
         )
 
-    def forward(self, x):
-        return self.net(x)
+        self.down_proj = nn.Linear(
+            intermediate_size, 
+            hidden_size,
+            bias = False
+        )
 
+        self.gate_proj = nn.Linear(
+            hidden_size,
+            intermediate_size,
+            bias = False
+        )
+
+        self.activation = nn.SiLU()
+
+    def forward(self, x):
+        up = self.up_proj(x)
+        gate = self.gate_proj(x)
+
+        swish_gate = self.activation(gate) * up
+        
+        return self.down_proj(swish_gate)
 
 def get_rope_frequencies(head_size, theta, device = None):
     pair_indices = torch.arange(
         head_size // 2,
-        device = device
+        device = device,
+        dtype = torch.float32
     )
 
     return theta ** (-2 * pair_indices / head_size)
 
-def apply_rope(x, theta = 10000):
+def apply_rope(x, theta = 10000.0):
     B, H, T, D = x.shape # shape post permute in the GQA section
 
     freqs = get_rope_frequencies(
@@ -36,7 +58,8 @@ def apply_rope(x, theta = 10000):
 
     positions = torch.arange(
         T,
-        device = x.device
+        device = x.device,
+        dtype = torch.float32
     )
 
     angles = positions[:, None] * freqs[None, :] # Column positions * row freqs
@@ -59,7 +82,7 @@ def apply_rope(x, theta = 10000):
 
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, hidden_size, num_kv_heads = 4, num_q_heads = 12, window_size = None, rope_theta = 10000):
+    def __init__(self, hidden_size, num_kv_heads = 4, num_q_heads = 12, window_size = None, rope_theta = 10000.0):
         super().__init__()
 
         self.hidden_size = hidden_size
@@ -70,19 +93,19 @@ class GroupedQueryAttention(nn.Module):
         self.window_size = window_size
         self.rope_theta = rope_theta
 
-        self.queries = nn.Linear(
+        self.q_proj = nn.Linear(
             hidden_size,
             num_q_heads * self.head_size,
             bias = False
         )
 
-        self.key = nn.Linear(
+        self.k_proj = nn.Linear(
             hidden_size,
             num_kv_heads * self.head_size,
             bias = False
         )
 
-        self.val = nn.Linear(
+        self.v_proj = nn.Linear(
             hidden_size,
             num_kv_heads * self.head_size,
             bias = False
@@ -98,7 +121,11 @@ class GroupedQueryAttention(nn.Module):
         self.k_norm = nn.RMSNorm(self.head_size)
 
     def create_mask(self, T, device):
-        positions = torch.arange(T, device = device)
+        positions = torch.arange(
+            T, 
+            device = device,
+            dtype = torch.float32
+        )
 
         i = positions[:, None]
         j = positions[None, :]
@@ -117,13 +144,13 @@ class GroupedQueryAttention(nn.Module):
         B, T, C = x.shape
         
         q = (
-            self.queries(x)
+            self.q_proj(x)
             .reshape(B, T, self.num_q_heads, self.head_size) # [B, T, 12, 128] 1536 split into 12 and 128
             .permute(0, 2, 1, 3)
         )
 
         k = (
-            self.key(x)
+            self.k_proj(x)
             .reshape(B, T, self.num_kv_heads, self.head_size) # [B, T, 4, 128]
             .permute(0, 2, 1, 3) # [B, 4, T, 128]
         )
@@ -131,11 +158,11 @@ class GroupedQueryAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        q = apply_rope(q, self.theta)
-        k = apply_rope(k, self.theta)
+        q = apply_rope(q, self.rope_theta)
+        k = apply_rope(k, self.rope_theta)
     
         v = (
-            self.val(x)
+            self.v_proj(x)
             .reshape(B, T, self.num_kv_heads, self.head_size)
             .permute(0, 2, 1, 3)
         )
@@ -160,3 +187,77 @@ class GroupedQueryAttention(nn.Module):
         
         out = self.output_proj(out)
         return out
+
+class DecoderBlock(nn.Module):
+    def __init__(self, hidden_size, intermediate_size, num_q_heads, num_kv_heads, window_size = None, rope_theta = 10000.0):
+        super().__init__()
+        
+        self.attention_block = GroupedQueryAttention(
+            hidden_size = hidden_size,
+            num_q_heads = num_q_heads,
+            num_kv_heads = num_kv_heads,
+            window_size = window_size,
+            rope_theta = rope_theta
+        )
+
+        self.attention_norm = nn.RMSNorm(hidden_size) # could have been put inside GQA, norms before attention is called
+        self.mlp_norm = nn.RMSNorm(hidden_size)
+
+        self.mlp = SwiGLU(
+            hidden_size = hidden_size,
+            intermediate_size = intermediate_size
+        )
+
+    def forward(self, x):
+        x = x + self.attention_block(
+            self.attention_norm(x)
+        )
+
+        x = x + self.mlp(
+            self.mlp_norm(x) # double residual connections with norm
+        )
+
+        return x
+
+class Transformer(nn.Module):
+    def __init__(self, num_l4g_blocks, hidden_size, intermediate_size, num_q_heads, num_kv_heads, window_size, vocab_size, rope_theta=10000.0):
+        super().__init__()
+        
+        self.d_blocks = nn.ModuleList()
+
+        self.token_embedding = nn.Embedding(vocab_size, hidden_size)
+
+        for i in range(num_l4g_blocks * 5):
+
+            loop_window_size = window_size
+            
+            if (i + 1) % 5 == 0: loop_window_size = None
+            
+            self.d_blocks.append(DecoderBlock(
+                hidden_size = hidden_size,
+                intermediate_size = intermediate_size,
+                num_q_heads = num_q_heads,
+                num_kv_heads = num_kv_heads,
+                window_size = loop_window_size,
+                rope_theta = rope_theta
+            ))
+
+        self.final_norm = nn.RMSNorm(hidden_size)
+
+        self.lm_head = nn.Linear(
+            hidden_size,
+            vocab_size,
+            bias = False
+        )
+
+        self.lm_head.weight = self.token_embedding.weight
+
+    def forward(self, x):
+        x = self.token_embedding(x)
+        
+        for block in self.d_blocks:
+            x = block(x)
+
+        x = self.final_norm(x)
+
+        return self.lm_head(x)
